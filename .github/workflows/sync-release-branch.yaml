@@ -6,7 +6,7 @@ concurrency:
 
 on:
   schedule:
-    - cron:  '0 2 * * *'
+    - cron: '0 2 * * *'
   workflow_dispatch:
 
 permissions:
@@ -25,37 +25,58 @@ jobs:
     env:
       SYNC_BRANCH: ${{ matrix.branch }}
 
-    defaults:
-      run:
-        shell: bash
-
     permissions:
       contents: write
       pull-requests: write
+      issues: write
 
     steps:
       - name: Generate GitHub App token
         id: app-token
-        uses: actions/create-github-app-token@67018539274d69449ef7c02e8e71183d1719ab42 # v2.1.4
+        uses: actions/create-github-app-token@v2.1.4
         with:
           app-id: ${{ vars.AUTH_APP_ID }}
           private-key: ${{ secrets.AUTH_APP_PRIVATE_KEY }}
+          repositories: ${{ github.repository }}
 
       - name: Get GitHub App User ID
         id: get-user-id
-        run: echo "user-id=$(gh api "/users/${{ steps.app-token.outputs.app-slug }}[bot]" --jq .id)" >> "$GITHUB_OUTPUT"
+        run: |
+          echo "user-id=$(gh api "/users/${{ steps.app-token.outputs.app-slug }}[bot]" --jq .id)" >> "$GITHUB_OUTPUT"
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
 
       - name: Configure git user
         run: |
           git config --global user.name '${{ steps.app-token.outputs.app-slug }}[bot]'
-          git config --global user.email '${{ steps.get-user-id.outputs.user-id }}+${{ steps.app-token.outputs.app-slug }}[bot]@users.noreply.github.com>'
+          git config --global user.email '${{ steps.get-user-id.outputs.user-id }}+${{ steps.app-token.outputs.app-slug }}[bot]@users.noreply.github.com'
 
-      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - name: Checkout code with all branches
+        uses: actions/checkout@v5.0.0
         with:
           token: ${{ steps.app-token.outputs.token }}
           fetch-depth: 0
+          ref: master
+          # 关键修复：获取所有分支
+          fetch-tags: false
+          # 显式获取目标分支
+          persist-credentials: true
+
+      - name: Fetch target branch explicitly
+        run: |
+          git fetch origin $SYNC_BRANCH
+
+      - name: Verify branches exist
+        run: |
+          echo "Available remote branches:"
+          git branch -r
+          echo "Checking if origin/$SYNC_BRANCH exists..."
+          if git show-ref --verify --quiet refs/remotes/origin/$SYNC_BRANCH; then
+            echo "✓ Branch origin/$SYNC_BRANCH exists"
+          else
+            echo "✗ Branch origin/$SYNC_BRANCH does not exist"
+            exit 1
+          fi
 
       - name: Merge and create PR
         env:
@@ -63,34 +84,84 @@ jobs:
         run: |
           set -euxo pipefail
 
-          DIFF=$(git rev-list --count HEAD...origin/${SYNC_BRANCH})
-          if [ $DIFF -eq 0 ]; then
-            echo "No changes in ${SYNC_BRANCH}"
-            exit 0
+          # 检查目标分支是否存在
+          if ! git show-ref --verify --quiet refs/remotes/origin/$SYNC_BRANCH; then
+            echo "Error: Branch origin/$SYNC_BRANCH does not exist"
+            exit 1
           fi
-          NEW_BRANCH_NAME=sync-${SYNC_BRANCH}-$(date +"%Y%m%d-%H%M%S")
-          git config --global user.name "${GITHUB_ACTOR}"
-          git config --global user.email "${GITHUB_ACTOR}@users.noreply.github.com"
-          git checkout -b ${NEW_BRANCH_NAME}
-          git merge origin/${SYNC_BRANCH} 2>&1 | tee merge.log
-          DIFF=$(git rev-list --count master...HEAD)
-          if [ $DIFF -eq 0 ]; then
-            echo "No changes in ${SYNC_BRANCH}"
-            exit 0
-          fi
-          git push origin ${NEW_BRANCH_NAME}:${NEW_BRANCH_NAME}
 
-          for pr in $(gh pr list --state open --base master --label sync-release-branch --search "Sync ${SYNC_BRANCH} in:title" --repo ${{ github.repository }} --json number --jq '.[] | .number'); do
-            gh pr close $pr --repo ${{ github.repository }} --delete-branch || true
-          done
-          gh pr create --title "Sync ${SYNC_BRANCH}" --body "Sync ${SYNC_BRANCH}" --base master --head ${NEW_BRANCH_NAME} --label sync-release-branch --repo ${{ github.repository }}
+          # 检查差异（修复后的命令）
+          DIFF=$(git rev-list --count origin/master...origin/$SYNC_BRANCH || echo "0")
+          echo "Difference between master and $SYNC_BRANCH: $DIFF commits"
+
+          if [ "$DIFF" -eq "0" ]; then
+            echo "No changes in $SYNC_BRANCH compared to master"
+            exit 0
+          fi
+
+          # 确保在 master 分支上
+          git checkout master
+          git pull origin master
+
+          # 创建新分支
+          NEW_BRANCH_NAME=sync-$SYNC_BRANCH-$(date +"%Y%m%d-%H%M%S")
+          git checkout -b $NEW_BRANCH_NAME
+
+          # 尝试合并
+          echo "Merging origin/$SYNC_BRANCH into $NEW_BRANCH_NAME..."
+          if git merge origin/$SYNC_BRANCH --no-ff --no-edit 2>&1 | tee merge.log; then
+            echo "✓ Merge successful"
+            MERGE_SUCCESS=true
+          else
+            echo "✗ Merge has conflicts"
+            MERGE_SUCCESS=false
+          fi
+
+          # 检查是否有实际变化
+          if [ "$MERGE_SUCCESS" = true ]; then
+            DIFF_AFTER_MERGE=$(git rev-list --count origin/master...HEAD)
+            if [ "$DIFF_AFTER_MERGE" -eq 0 ]; then
+              echo "No effective changes after merge"
+              git checkout master
+              git branch -D $NEW_BRANCH_NAME
+              exit 0
+            fi
+
+            # 推送分支
+            git push origin $NEW_BRANCH_NAME
+
+            # 关闭旧的 PR
+            echo "Checking for existing PRs..."
+            for pr in $(gh pr list --state open --base master --label sync-release-branch --search "Sync $SYNC_BRANCH" --json number --jq '.[].number'); do
+              echo "Closing old PR #$pr"
+              gh pr close $pr --delete-branch || true
+            done
+
+            # 创建新 PR
+            echo "Creating new PR..."
+            gh pr create \
+              --title "Sync $SYNC_BRANCH $(date +"%Y-%m-%d")" \
+              --body "Automated sync of $SYNC_BRANCH branch into master" \
+              --base master \
+              --head $NEW_BRANCH_NAME \
+              --label sync-release-branch
+          else
+            echo "Merge failed due to conflicts"
+            exit 1
+          fi
 
       - name: Send notification to Slack
         if: failure()
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: |
-          awk '{printf "%s\\n", $0}' merge.log > merge.log.1
+          if [ -f merge.log ]; then
+            # 简化日志内容，避免 Slack 消息过长
+            MERGE_LOG_CONTENT=$(head -20 merge.log | sed 's/"/\\"/g')
+          else
+            MERGE_LOG_CONTENT="No merge log available"
+          fi
+          
           cat <<EOF > payload.json
           {
             "blocks": [
@@ -98,17 +169,18 @@ jobs:
                 "type": "section",
                 "text": {
                   "type": "mrkdwn",
-                  "text": "Automatic sync of ${SYNC_BRANCH} branch failed: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+                  "text": "❌ Automatic sync of \`$SYNC_BRANCH\` failed\n*Run:* https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
                 }
               },
               {
-                "type": "section",
+                "type": "section", 
                 "text": {
-                  "type": "mrkdwn",
-                  "text": "\`\`\`$(cat merge.log.1)\`\`\`"
+                  "type": "plain_text",
+                  "text": "Error: $MERGE_LOG_CONTENT"
                 }
               }
             ]
           }
           EOF
-          curl -X POST -H 'Content-type: application/json' --data @payload.json "$SLACK_WEBHOOK_URL"
+          
+          curl -s -X POST -H 'Content-type: application/json' --data @payload.json "$SLACK_WEBHOOK_URL" || echo "Slack notification failed"
