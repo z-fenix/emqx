@@ -5,11 +5,6 @@ on:
     - cron: '0 2 * * *'
   workflow_dispatch:
 
-# 关键：添加 workflows 写入权限
-permissions:
-  contents: write
-  workflows: write
-
 jobs:
   sync:
     runs-on: ubuntu-latest
@@ -25,17 +20,28 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-      - name: Sync branches
+      - name: Setup upstream
         run: |
+          git remote remove upstream 2>/dev/null || true
           git remote add upstream https://github.com/emqx/emqx.git
-          git fetch upstream
-          
-          # Sync master
+
+      - name: Fetch from upstream
+        run: git fetch upstream
+
+      - name: Sync master branch
+        run: |
           git checkout master
           git merge upstream/master --no-edit
           git push origin master
-          
-          # Sync release-61
-          git checkout release-61 2>/dev/null || git checkout -b release-61 origin/release-61
-          git merge upstream/release-61 --no-edit
-          git push origin release-61
+          echo "✅ Master branch synced successfully"
+
+      - name: Sync release-61 branch
+        run: |
+          if git show-ref --verify --quiet refs/remotes/upstream/release-61; then
+            git checkout release-61 2>/dev/null || git checkout -b release-61 origin/release-61
+            git merge upstream/release-61 --no-edit
+            git push origin release-61
+            echo "✅ Release-61 branch synced successfully"
+          else
+            echo "⚠️ Upstream release-61 branch not found, skipping"
+          fi
